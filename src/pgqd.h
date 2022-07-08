@@ -9,7 +9,8 @@
 #include <usual/list.h>
 #include <usual/statlist.h>
 #include <usual/logging.h>
-#include <usual/pgsocket.h>
+
+#include "pgsocket.h"
 
 enum DbState {
 	DB_CLOSED,
@@ -31,6 +32,7 @@ struct MaintOp;
 struct PgDatabase {
 	struct List head;
 	const char *name;
+	const char *logname;
 	struct PgSocket *c_ticker;
 	struct PgSocket *c_maint;
 	struct PgSocket *c_retry;
@@ -70,6 +72,7 @@ struct Stats {
 
 extern struct Config cf;
 extern struct Stats stats;
+extern struct event_base *ev_base;
 
 void launch_ticker(struct PgDatabase *db);
 void launch_maint(struct PgDatabase *db);
@@ -77,7 +80,7 @@ void launch_retry(struct PgDatabase *db);
 
 void free_maint(struct PgDatabase *db);
 
-const char *make_connstr(const char *dbname);
+char *make_connstr(const char *dbname);
 
 #endif
 

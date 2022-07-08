@@ -2,7 +2,7 @@
 
 #include <getopt.h>
 
-#include <event.h>
+#include <event2/event.h>
 
 #include <usual/string.h>
 #include <usual/signal.h>
@@ -43,6 +43,15 @@ static STATLIST(database_list);
 
 static int got_sigint;
 
+static struct event *ev_stats;
+static struct event *ev_sigterm;
+static struct event *ev_sigint;
+#ifdef SIGHUP
+static struct event *ev_sighup;
+#endif
+
+struct event_base *ev_base;
+
 #define CF_REL_BASE struct Config
 static const struct CfKey conf_params[] = {
 	CF_ABS("logfile", CF_FILE, cf_logfile, 0, NULL),
@@ -80,33 +89,31 @@ static void load_config(void)
 	reset_logging();
 }
 
-static void handle_sigterm(int sock, short flags, void *arg)
+static void handle_sigterm(evutil_socket_t sock, short flags, void *arg)
 {
 	log_info("Got SIGTERM, fast exit");
 	/* pidfile cleanup happens via atexit() */
 	exit(1);
 }
 
-static void handle_sigint(int sock, short flags, void *arg)
+static void handle_sigint(evutil_socket_t sock, short flags, void *arg)
 {
 	log_info("Got SIGINT, shutting down");
 	/* notify main loop to exit */
 	got_sigint = 1;
 }
 
-static void handle_sighup(int sock, short flags, void *arg)
+#ifdef SIGHUP
+static void handle_sighup(evutil_socket_t sock, short flags, void *arg)
 {
 	log_info("Got SIGHUP, re-reading config");
 	load_config();
 	recheck_dbs();
 }
+#endif
 
 static void signal_setup(void)
 {
-	static struct event ev_sighup;
-	static struct event ev_sigterm;
-	static struct event ev_sigint;
-
 	int err;
 
 #ifdef SIGPIPE
@@ -122,27 +129,72 @@ static void signal_setup(void)
 
 #ifdef SIGHUP
 	/* catch signals */
-	signal_set(&ev_sighup, SIGHUP, handle_sighup, NULL);
-	err = signal_add(&ev_sighup, NULL);
+	ev_sighup = evsignal_new(ev_base, SIGHUP, handle_sighup, NULL);
+	if (!ev_sighup)
+		fatal_perror("evsignal_new");
+	err = evsignal_add(ev_sighup, NULL);
 	if (err < 0)
-		fatal_perror("signal_add");
+		fatal_perror("evsignal_add");
 #endif
 
-	signal_set(&ev_sigterm, SIGTERM, handle_sigterm, NULL);
-	err = signal_add(&ev_sigterm, NULL);
+	ev_sigterm = evsignal_new(ev_base, SIGTERM, handle_sigterm, NULL);
+	if (!ev_sigterm)
+		fatal_perror("evsignal_new");
+	err = evsignal_add(ev_sigterm, NULL);
 	if (err < 0)
-		fatal_perror("signal_add");
+		fatal_perror("evsignal_add");
 
-	signal_set(&ev_sigint, SIGINT, handle_sigint, NULL);
-	err = signal_add(&ev_sigint, NULL);
+	ev_sigint = evsignal_new(ev_base, SIGINT, handle_sigint, NULL);
+	if (!ev_sigint)
+		fatal_perror("evsignal_new");
+	err = evsignal_add(ev_sigint, NULL);
 	if (err < 0)
 		fatal_perror("signal_add");
 }
 
-const char *make_connstr(const char *dbname)
+char *make_connstr(const char *dbname)
 {
-	static char buf[512];
-	snprintf(buf, sizeof(buf), "%s dbname=%s ", cf.base_connstr, dbname);
+	size_t buflen;
+	char *buf, *dst;
+	const char *src;
+
+	buflen = strlen(cf.base_connstr) + strlen(dbname) * 2 + 32;
+	buf = calloc(1, buflen);
+	if (!buf)
+		return NULL;
+	snprintf(buf, buflen, "%s dbname='", cf.base_connstr);
+	dst = buf + strlen(buf);
+	for (src = dbname; *src; src++) {
+		if (*src == '\'' || *src == '\\') {
+			*dst++ = '\\';
+		}
+		*dst++ = *src;
+	}
+	*dst = '\'';
+	return buf;
+}
+
+static char *safe_dbname(const char *dbname)
+{
+	char *buf, *dst;
+	const char *src;
+	size_t buflen;
+
+	buflen = strlen(dbname) * 2 + 3;
+	buf = calloc(1, buflen);
+	if (!buf)
+		return NULL;
+	dst = buf;
+	*dst++ = '[';
+	for (src = dbname; *src; src++) {
+		if ((unsigned char)*src < ' ') {
+			*dst++ = '?';
+		} else {
+			*dst++ = *src;
+		}
+	}
+	*dst++ = ']';
+	*dst++ = '\0';
 	return buf;
 }
 
@@ -162,7 +214,23 @@ static void launch_db(const char *dbname)
 
 	/* create new db entry */
 	db = calloc(1, sizeof(*db));
+	if (!db) {
+		log_error("calloc: %s", strerror(errno));
+		return;
+	}
 	db->name = strdup(dbname);
+	if (!db->name) {
+		log_error("strdup: %s", strerror(errno));
+		free(db);
+		return;
+	}
+	db->logname = safe_dbname(dbname);
+	if (!db->logname) {
+		log_error("safe_dbname: %s", strerror(errno));
+		free((void *)db->name);
+		free(db);
+		return;
+	}
 	list_init(&db->head);
 	statlist_init(&db->maint_op_list, "maint_op_list");
 	statlist_append(&database_list, &db->head);
@@ -174,13 +242,14 @@ static void launch_db(const char *dbname)
 static void drop_db(struct PgDatabase *db, bool log)
 {
 	if (log)
-		log_info("Unregister database: %s", db->name);
+		log_info("Unregister database: %s", db->logname);
 	statlist_remove(&database_list, &db->head);
 	pgs_free(db->c_ticker);
 	pgs_free(db->c_maint);
 	pgs_free(db->c_retry);
 	free_maint(db);
-	free((void*)db->name);
+	free((void *)db->logname);
+	free((void *)db->name);
 	free(db);
 }
 
@@ -229,8 +298,17 @@ static void detect_handler(struct PgSocket *sk, void *arg, enum PgEvent ev, PGre
 static void detect_dbs(void)
 {
 	if (!db_template) {
-		const char *cstr = make_connstr(cf.initial_database);
-		db_template = pgs_create(cstr, detect_handler, NULL);
+		char *cstr = make_connstr(cf.initial_database);
+		if (!cstr) {
+			log_error("make_connstr: %s", strerror(errno));
+			return;
+		}
+		db_template = pgs_create(cstr, detect_handler, NULL, ev_base);
+		free(cstr);
+		if (!db_template) {
+			log_error("pgs_create: %s", strerror(errno));
+			return;
+		}
 	}
 	pgs_connect(db_template);
 }
@@ -274,9 +352,8 @@ static void recheck_dbs(void)
 	}
 }
 
-static struct event stats_ev;
 
-static void stats_handler(int fd, short flags, void *arg)
+static void stats_handler(evutil_socket_t fd, short flags, void *arg)
 {
 	struct timeval tv = { cf.stats_period, 0 };
 
@@ -284,15 +361,17 @@ static void stats_handler(int fd, short flags, void *arg)
 		 stats.n_ticks, stats.n_maint, stats.n_retry);
 	memset(&stats, 0, sizeof(stats));
 
-	if (evtimer_add(&stats_ev, &tv) < 0)
+	if (evtimer_add(ev_stats, &tv) < 0)
 		fatal_perror("evtimer_add");
 }
 
 static void stats_setup(void)
 {
 	struct timeval tv = { cf.stats_period, 0 };
-	evtimer_set(&stats_ev, stats_handler, NULL);
-	if (evtimer_add(&stats_ev, &tv) < 0)
+	ev_stats = evtimer_new(ev_base, stats_handler, NULL);
+	if (!ev_stats)
+		fatal_perror("evtimer_new");
+	if (evtimer_add(ev_stats, &tv) < 0)
 		fatal_perror("evtimer_add");
 }
 
@@ -309,12 +388,19 @@ static void cleanup(void)
 
 	event_base_free(NULL);
 	reset_logging();
+
+#ifdef SIGHUP
+	event_free(ev_sighup);
+#endif
+	event_free(ev_sigint);
+	event_free(ev_sigterm);
+	event_free(ev_stats);
 }
 
 static void main_loop_once(void)
 {
 	reset_time_cache();
-	if (event_loop(EVLOOP_ONCE) != 0) {
+	if (event_base_loop(ev_base, EVLOOP_ONCE) != 0) {
 		log_error("event_loop failed: %s", strerror(errno));
 	}
 }
@@ -350,6 +436,9 @@ int main(int argc, char *argv[])
 			break;
 		case 'h':
 			printf(usage_str);
+			return 0;
+		case 'V':
+			printf("%s version %s\n", PACKAGE_NAME, PACKAGE_VERSION);
 			return 0;
 #ifdef SIGHUP
 		case 'r':
@@ -397,8 +486,9 @@ int main(int argc, char *argv[])
 
 	daemonize(cf.pidfile, daemon);
 
-	if (!event_init())
-		fatal("event_init failed");
+	ev_base = event_base_new();
+	if (!ev_base)
+		fatal("event_base_new failed");
 
 	signal_setup();
 
@@ -410,6 +500,7 @@ int main(int argc, char *argv[])
 		main_loop_once();
 
 	cleanup();
+	event_base_free(ev_base);
 
 	return 0;
 }
