@@ -27,7 +27,7 @@ jobs:
           - {pgver: "14", os: "macos-latest"}
     steps:
       - name: "Checkout"
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           submodules: true
 
@@ -112,7 +112,7 @@ jobs:
           - {os: "windows-2019", arch: x86_64, mingw: mingw64}
     steps:
       - name: "Checkout"
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           submodules: true
 
