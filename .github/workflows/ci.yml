@@ -71,7 +71,7 @@ jobs:
         if: ${{runner.os == 'macOS'}}
         run: |
           echo "::group::install"
-          brew install patchutils gnu-sed docutils libevent postgresql@${{matrix.test.pgver}} autoconf automake
+          brew install patchutils gnu-sed docutils libevent postgresql@${{matrix.test.pgver}} autoconf automake libtool
           echo "::endgroup::"
           echo "/usr/local/opt/docutils/bin" >> $GITHUB_PATH
           echo "/usr/local/opt/postgresql@${{matrix.test.pgver}}/bin" >> $GITHUB_PATH
