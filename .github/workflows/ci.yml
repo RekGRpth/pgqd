@@ -76,13 +76,13 @@ jobs:
           echo "/usr/local/opt/docutils/bin" >> $GITHUB_PATH
           echo "/usr/local/opt/postgresql@${{matrix.test.pgver}}/bin" >> $GITHUB_PATH
           echo "SED=gsed" >> $GITHUB_ENV
-          echo "RST2MAN=rst2man.py" >> $GITHUB_ENV
+          echo "RST2MAN=rst2man" >> $GITHUB_ENV
 
       - name: "Build"
         run: |
           ./autogen.sh
           ./configure --prefix=${GITHUB_WORKSPACE}/testinstall
-          make RST2MAN=${{env.RST2MAN}}
+          make RST2MAN=${RST2MAN}
           make install
 
       - name: "Install PgQ"
